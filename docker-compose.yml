@@ -1,0 +1,37 @@
+# 飞控代数等价复核：Web 服务 + 一次性验收服务
+#
+# 宿主端口可配置（默认 8080）：
+#   HOST_PORT=9090 docker compose up
+# 或写入 .env： HOST_PORT=9090
+
+services:
+  web:
+    build: .
+    image: equivalence-verifier:latest
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8080"
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).status==200 else 1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 2s
+    restart: unless-stopped
+
+  # 一次性验收服务：执行后退出，以退出码报告验收结果
+  #   docker compose up verify; docker compose ps verify  查看 Exited (0)
+  verify:
+    image: equivalence-verifier:latest
+    build: .
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://web:8080
+      HTTP_WAIT_SECONDS: "30"
+    entrypoint: ["python", "scripts/verify"]
+    restart: "no"

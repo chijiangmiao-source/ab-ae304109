@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>控制表达式代数重写复核</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>控制表达式代数重写复核</h1>
+    <p class="subtitle">
+      基于已批准等式规则的同余闭包饱和判定 ·
+      节点上限 <input id="maxNodes" type="number" min="1" value="80" /> ·
+      应用上限 <input id="maxApps" type="number" min="1" value="5000" />
+    </p>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>待复核表达式</h2>
+      <label class="field">
+        <span>左式</span>
+        <input id="leftExpr" type="text" value="f(add(a,b))" spellcheck="false" />
+      </label>
+      <label class="field">
+        <span>右式</span>
+        <input id="rightExpr" type="text" value="f(add(b,a))" spellcheck="false" />
+      </label>
+
+      <div class="rules-head">
+        <h2>已批准的等式规则（至多 20 条，形如 <code>lhs = rhs</code>）</h2>
+        <div class="rule-actions">
+          <button type="button" id="addRule">+ 添加规则</button>
+          <button type="button" id="loadExample" class="secondary">载入交换律示例</button>
+        </div>
+      </div>
+      <p class="hint">
+        约定：单个小写字母（如 <code>x</code>、<code>y</code>）为变量；
+        <code>zero</code>、<code>nil</code> 等多字符叶子为必须字面匹配的具名常量。
+        规则右侧不得引入左侧未出现的变量。
+      </p>
+      <ol id="ruleList" class="rules"></ol>
+
+      <div class="submit-row">
+        <button type="button" id="submit" class="primary">提交复核</button>
+        <span id="requestState" class="state"></span>
+      </div>
+    </section>
+
+    <section class="panel result" id="resultPanel" hidden>
+      <h2>规范摘要</h2>
+      <div id="summary" class="summary"></div>
+      <h2>结论</h2>
+      <div id="verdict" class="verdict"></div>
+      <div id="issues"></div>
+      <div id="limit"></div>
+      <div id="proofWrap">
+        <h2>逐步依据（规则实例与同余）</h2>
+        <ol id="proof" class="proof"></ol>
+      </div>
+      <div id="classesWrap">
+        <h2>饱和后等价类（稳定摘要）</h2>
+        <div id="classes" class="classes"></div>
+      </div>
+      <div id="stats"></div>
+    </section>
+  </main>
+
+  <footer>
+    <span>重写规则饱和后才作等价判断 · 未饱和返回“未完成” · 无效输入清除旧结论</span>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

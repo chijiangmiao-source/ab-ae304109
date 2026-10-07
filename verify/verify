@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""一次性验收服务（acceptance）。
+
+职责
+====
+
+围绕三类必测结论对**真实运行的服务**做接口 / HTTP 冒烟，并穿插
+代码测试与构建检查；执行结束后以进程退出码报告验收结果：
+
+* 交换律等价推导（含规则实例与同余依据）；
+* 饱和后的非等价（稳定等价类摘要、清除旧证据）；
+* 资源受限（80 节点上限）下的未完成。
+
+运行模式
+--------
+
+* 远程模式（Docker Compose 中使用）：设置 ``BASE_URL`` 指向已就绪的
+  web 服务（如 ``http://web:8080``），脚本只做 HTTP 冒烟 + 测试/构建。
+* 本地模式：未设置 ``BASE_URL`` 时，脚本自行在可配置端口
+  （``HOST_PORT``，默认 0 = 内核分配）启动 ``app.web.server`` 子进程，
+  冒烟结束后保证关闭。
+
+无论哪种模式都会：构建检查（compileall）→ 冒烟 → 单元测试穿插进行。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+GREEN = "\033[32m"
+RED = "\033[31m"
+YELLOW = "\033[33m"
+RESET = "\033[0m"
+
+results: List[Tuple[str, bool, str]] = []
+
+
+def report(name: str, ok: bool, detail: str = "") -> bool:
+    results.append((name, ok, detail))
+    mark = f"{GREEN}✓{RESET}" if ok else f"{RED}✗{RESET}"
+    line = f"  {mark} {name}"
+    if detail:
+        line += f"  —  {detail}"
+    print(line)
+    return ok
+
+
+def section(title: str) -> None:
+    print(f"\n{YELLOW}== {title} =={RESET}")
+
+
+# ---------------------------------------------------------------------
+# 构建检查与代码测试
+# ---------------------------------------------------------------------
+def build_check() -> bool:
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "compileall",
+            "-q",
+            os.path.join(PROJECT_ROOT, "app"),
+            os.path.join(PROJECT_ROOT, "verify"),
+        ],
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return report(
+        "构建检查：字节码编译 app/ 与 verify/",
+        proc.returncode == 0,
+        proc.stdout.strip()[:200],
+    )
+
+
+def unit_tests() -> bool:
+    proc = subprocess.run(
+        [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    # unittest 末尾汇总行形如 “Ran N tests in ... OK / FAILED”。
+    tail = "\n".join(proc.stdout.strip().splitlines()[-3:])
+    return report(
+        "代码测试：unittest 全套",
+        proc.returncode == 0,
+        tail.replace("\n", " | "),
+    )
+
+
+# ---------------------------------------------------------------------
+# 真实 HTTP 冒烟
+# ---------------------------------------------------------------------
+def _request(
+    base: str, method: str, path: str, payload: Optional[dict] = None,
+    timeout: float = 20.0,
+) -> Tuple[int, Any]:
+    url = base.rstrip("/") + path
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    ctype = resp.headers.get("Content-Type", "")
+    if "json" in ctype:
+        return resp.status, json.loads(raw.decode("utf-8"))
+    return resp.status, raw
+
+
+def wait_ready(base: str, attempts: int = 40) -> bool:
+    for i in range(attempts):
+        try:
+            status, _ = _request(base, "GET", "/healthz", timeout=3)
+            if status == 200:
+                return True
+        except (urllib.error.URLError, ConnectionError, OSError):
+            time.sleep(0.5)
+    return False
+
+
+def smoke_page(base: str) -> bool:
+    status, body = _request(base, "GET", "/")
+    text = body.decode("utf-8") if isinstance(body, bytes) else str(body)
+    ok = status == 200 and "代数重写复核" in text and 'src="/app.js"' in text
+    return report("页面 GET / 可访问并含复核入口", ok, f"HTTP {status}")
+
+
+def smoke_health(base: str) -> bool:
+    status, data = _request(base, "GET", "/healthz")
+    ok = status == 200 and data.get("status") == "ok"
+    return report("健康响应 GET /healthz", ok, json.dumps(data, ensure_ascii=False))
+
+
+def smoke_equivalent(base: str) -> bool:
+    payload = {
+        "left": "f(add(a,b))",
+        "right": "f(add(b,a))",
+        "rules": ["add(x,y) = add(y,x)"],
+        "max_nodes": 80,
+    }
+    status, data = _request(base, "POST", "/api/verify", payload)
+    summary = data.get("summary", {})
+    proof = data.get("proof") or []
+
+    def walk_kinds(steps):
+        kinds, rule_subs = set(), []
+        for st in steps:
+            kinds.add(st["by"]["kind"])
+            if st["by"]["kind"] == "rule":
+                rule_subs.append(st["by"].get("substitution", {}))
+            for child in st.get("premise_proofs", []) or []:
+                ck, cr = walk_kinds(child.get("steps", []))
+                kinds |= ck
+                rule_subs.extend(cr)
+        return kinds, rule_subs
+
+    kinds, rule_subs = walk_kinds(proof)
+    subst_ok = all(set(s) == {"x", "y"} for s in rule_subs) and bool(rule_subs)
+    ok = (
+        status == 200
+        and data.get("status") == "equivalent"
+        and summary.get("max_nodes") == 80
+        and bool(proof)
+        and {"rule", "congruence"} <= kinds
+        and subst_ok
+        and proof[0]["from"] == "f(add(a,b))"
+        and proof[-1]["to"] == "f(add(b,a))"
+    )
+    detail = f"{len(proof)} 个顶层步骤，依据含 {sorted(kinds)}（规则可在同余前提中下钻）"
+    return report("场景一：交换律等价推导（规则实例 + 同余）", ok, detail)
+
+
+def smoke_not_equivalent(base: str) -> bool:
+    payload = {"left": "a", "right": "b", "rules": []}
+    status, data = _request(base, "POST", "/api/verify", payload)
+    first_digests = [c["digest"] for c in (data.get("classes") or [])]
+    # 再发一次，确认摘要稳定；左右交换也应得到同一组摘要。
+    swapped = _request(
+        base, "POST", "/api/verify",
+        {"left": "b", "right": "a", "rules": []},
+    )[1]
+    second_digests = [c["digest"] for c in (swapped.get("classes") or [])]
+    stable = sorted(first_digests) == sorted(second_digests)
+    ok = (
+        status == 200
+        and data.get("status") == "not_equivalent"
+        and data.get("proof") is None  # 旧证据被清除
+        and data.get("left_class") != data.get("right_class")
+        and len(data.get("classes") or []) == 2
+        and all(len(d) == 16 for d in first_digests)
+        and stable
+    )
+    detail = "2 个等价类，digest 稳定且无证据残留"
+    return report("场景二：饱和后非等价（稳定摘要、清除旧证据）", ok, detail)
+
+
+def smoke_unknown(base: str) -> bool:
+    payload = {
+        "left": "a",
+        "right": "g(b)",
+        "rules": ["x = d(f(x))"],
+        "max_nodes": 80,
+        "max_applications": 5000,
+    }
+    status, data = _request(base, "POST", "/api/verify", payload, timeout=60)
+    ok = (
+        status == 200
+        and data.get("status") == "unknown"
+        and bool(data.get("limit_reason"))
+        and "80" in data.get("limit_reason", "")
+        and data.get("proof") is None
+        and data.get("classes") is None
+    )
+    apps = (data.get("stats") or {}).get("rule_applications")
+    return report(
+        "场景三：80 节点资源受限下未完成（不作等价判断）",
+        ok,
+        f"应用 {apps} 次后触及上限",
+    )
+
+
+def smoke_invalid_clears(base: str) -> bool:
+    # 先得到一次等价结论，再提交语法错误，确认旧结论/证据被清除。
+    good = _request(
+        base,
+        "POST",
+        "/api/verify",
+        {
+            "left": "f(add(a,b))",
+            "right": "f(add(b,a))",
+            "rules": ["add(x,y) = add(y,x)"],
+        },
+    )[1]
+    bad = _request(
+        base,
+        "POST",
+        "/api/verify",
+        {"left": "f(add(a,b", "right": "x", "rules": ["h(u)=k(v)"]},
+    )[1]
+    codes = {i["code"] for i in bad.get("issues", [])}
+    ok = (
+        good.get("status") == "equivalent"
+        and bad.get("status") == "invalid"
+        and bad.get("proof") is None
+        and bad.get("classes") is None
+        and {"parse_error", "unbound_variable"} <= codes
+    )
+    return report("附加：语法错误与未绑定变量判定为无效并清除旧结论", ok,
+                  ", ".join(sorted(codes)))
+
+
+# ---------------------------------------------------------------------
+# 本地模式：自行启动服务子进程
+# ---------------------------------------------------------------------
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def start_local_server() -> Tuple[Optional[subprocess.Popen], str]:
+    port = int(os.environ.get("HOST_PORT", "0") or "0")
+    if port == 0:
+        port = _free_port()
+    env = dict(os.environ)
+    env["HOST_ADDR"] = "127.0.0.1"
+    env["HOST_PORT"] = str(port)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "app.web.server"],
+        cwd=PROJECT_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    base = f"http://127.0.0.1:{port}"
+    if not wait_ready(base):
+        proc.terminate()
+        out = proc.stdout.read() if proc.stdout else ""
+        raise RuntimeError(f"本地服务未能就绪：\n{out}")
+    return proc, base
+
+
+def main() -> int:
+    print(f"{YELLOW}控制表达式代数重写复核 —— 验收服务（一次性）{RESET}")
+    base = os.environ.get("BASE_URL", "").strip()
+    proc: Optional[subprocess.Popen] = None
+    local_mode = not base
+
+    try:
+        # 1) 先做构建检查。
+        section("构建检查")
+        build_ok = build_check()
+
+        # 2) 准备真实服务。
+        section("服务就绪")
+        if local_mode:
+            proc, base = start_local_server()
+            print(f"  本地服务已启动：{base}")
+        else:
+            ready = wait_ready(base)
+            print(f"  使用远程服务：{base}（就绪={ready}）")
+            if not ready:
+                report("等待远程服务就绪", False)
+                return _summary(1)
+
+        # 3) 穿插冒烟与代码测试。
+        section("HTTP / 接口冒烟（一）：页面、健康、交换律等价")
+        smoke_page(base)
+        smoke_health(base)
+        smoke_equivalent(base)
+
+        section("代码测试（穿插）")
+        tests_ok = unit_tests()
+
+        section("HTTP / 接口冒烟（二）：非等价、未完成、无效")
+        smoke_not_equivalent(base)
+        smoke_unknown(base)
+        smoke_invalid_clears(base)
+
+    except Exception as exc:  # 验收脚本自身异常视为失败
+        report("验收脚本执行异常", False, repr(exc))
+        build_ok = locals().get("build_ok", False)
+        tests_ok = False
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    return _summary(0 if all(ok for _, ok, _ in results) else 1)
+
+
+def _summary(code: int) -> int:
+    section("验收汇总")
+    passed = sum(1 for _, ok, _ in results if ok)
+    total = len(results)
+    for name, ok, detail in results:
+        if not ok:
+            print(f"  {RED}失败：{name} {detail}{RESET}")
+    if code == 0 and passed == total:
+        print(f"{GREEN}验收通过：{passed}/{total} 项全部成功{RESET}")
+    else:
+        print(f"{RED}验收失败：{passed}/{total} 项成功{RESET}")
+    return 0 if code == 0 and passed == total and total > 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
